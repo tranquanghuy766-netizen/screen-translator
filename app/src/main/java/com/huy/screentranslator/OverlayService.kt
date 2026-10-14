@@ -7,6 +7,7 @@ import android.app.Service
 import android.content.Context
 import android.content.Intent
 import android.content.pm.ServiceInfo
+import android.content.res.Configuration
 import android.graphics.Bitmap
 import android.graphics.Color
 import android.graphics.PixelFormat
@@ -23,6 +24,7 @@ import android.os.Handler
 import android.os.HandlerThread
 import android.os.IBinder
 import android.os.Looper
+import android.os.SystemClock
 import android.util.DisplayMetrics
 import android.util.TypedValue
 import android.view.Gravity
@@ -35,7 +37,9 @@ import com.google.mlkit.vision.common.InputImage
 import com.google.mlkit.vision.text.TextRecognition
 import com.google.mlkit.vision.text.latin.TextRecognizerOptions
 import org.json.JSONArray
+import org.json.JSONException
 import org.json.JSONObject
+import java.io.IOException
 import java.net.HttpURLConnection
 import java.net.URL
 import java.util.concurrent.Executors
@@ -43,19 +47,27 @@ import kotlin.math.abs
 
 private class Block(val text: String, val box: Rect)
 
+private class RetryException(message: String) : Exception(message)
+
 class OverlayService : Service() {
 
     companion object {
         const val DEFAULT_MODEL = "gemini-flash-lite-latest"
+        private const val CHUNK = 30
         private const val SYSTEM_PROMPT =
             "You are a phone-screen translator. The user message is a JSON array of text blocks " +
-                "read by OCR from ONE phone screen (could be a game, app, website, comic, chat...). " +
-                "Translate every block into natural Vietnamese, using the whole screen as context " +
-                "and keeping terminology consistent. Return ONLY a JSON array of strings with exactly " +
-                "the same length and order as the input. If a block is already Vietnamese, or is only " +
+                "read by OCR from ONE phone screen (could be a game, app, website, comic speech bubbles, chat...). " +
+                "Blocks are in reading order. Translate every English block into natural Vietnamese, " +
+                "using the whole screen as context and keeping terminology consistent. " +
+                "Return ONLY a JSON array of strings with exactly the same length and order as the input. " +
+                "Never return English text or the original text unchanged for an English block. " +
+                "If a block is already Vietnamese (OCR may have dropped its diacritics), or is only " +
                 "numbers, symbols, a code or a proper name that should stay unchanged, return an empty " +
                 "string for that block. Keep each translation concise, because it will be drawn in the " +
                 "same box as the original text."
+        private const val VI_CHARS =
+            "ăâđêôơưĂÂĐÊÔƠƯàáảãạằắẳẵặầấẩẫậèéẻẽẹềếểễệìíỉĩịòóỏõọồốổỗộờớởỡợùúủũụừứửữựỳýỷỹỵ" +
+                "ÀÁẢÃẠẰẮẲẴẶẦẤẨẪẬÈÉẺẼẸỀẾỂỄỆÌÍỈĨỊÒÓỎÕỌỒỐỔỖỘỜỚỞỠỢÙÚỦŨỤỪỨỬỮỰỲÝỶỸỴ"
     }
 
     private lateinit var wm: WindowManager
@@ -70,6 +82,9 @@ class OverlayService : Service() {
     private val lock = Any()
     private var screenW = 0
     private var screenH = 0
+    private var dpi = 0
+
+    @Volatile private var lastFrameTime = 0L
 
     private val mainHandler = Handler(Looper.getMainLooper())
     private lateinit var bgThread: HandlerThread
@@ -107,6 +122,11 @@ class OverlayService : Service() {
         return START_NOT_STICKY
     }
 
+    override fun onConfigurationChanged(newConfig: Configuration) {
+        super.onConfigurationChanged(newConfig)
+        mainHandler.postDelayed({ resizeCapture() }, 300)
+    }
+
     private fun startAsForeground() {
         val channelId = "overlay"
         val nm = getSystemService(NotificationManager::class.java)
@@ -125,12 +145,36 @@ class OverlayService : Service() {
         }
     }
 
-    private fun startCapture(code: Int, data: Intent) {
+    private fun readScreenSize() {
         val metrics = DisplayMetrics()
         @Suppress("DEPRECATION")
         wm.defaultDisplay.getRealMetrics(metrics)
         screenW = metrics.widthPixels
         screenH = metrics.heightPixels
+        dpi = metrics.densityDpi
+    }
+
+    private fun makeReader(w: Int, h: Int): ImageReader {
+        val reader = ImageReader.newInstance(w, h, PixelFormat.RGBA_8888, 3)
+        reader.setOnImageAvailableListener({ r ->
+            val img = try {
+                r.acquireLatestImage()
+            } catch (e: Exception) {
+                null
+            }
+            if (img != null) {
+                lastFrameTime = SystemClock.uptimeMillis()
+                synchronized(lock) {
+                    latest?.close()
+                    latest = img
+                }
+            }
+        }, bgHandler)
+        return reader
+    }
+
+    private fun startCapture(code: Int, data: Intent) {
+        readScreenSize()
 
         bgThread = HandlerThread("capture")
         bgThread.start()
@@ -144,28 +188,41 @@ class OverlayService : Service() {
             }
         }, bgHandler)
 
-        val reader = ImageReader.newInstance(screenW, screenH, PixelFormat.RGBA_8888, 3)
-        reader.setOnImageAvailableListener({ r ->
-            val img = try {
-                r.acquireLatestImage()
-            } catch (e: Exception) {
-                null
-            }
-            if (img != null) {
-                synchronized(lock) {
-                    latest?.close()
-                    latest = img
-                }
-            }
-        }, bgHandler)
-
+        val reader = makeReader(screenW, screenH)
         virtualDisplay = mp.createVirtualDisplay(
-            "screen-translator", screenW, screenH, metrics.densityDpi,
+            "screen-translator", screenW, screenH, dpi,
             DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR,
             reader.surface, null, bgHandler
         )
         projection = mp
         imageReader = reader
+    }
+
+    private fun resizeCapture() {
+        if (projection == null) return
+        val oldW = screenW
+        val oldH = screenH
+        readScreenSize()
+        if (screenW == oldW && screenH == oldH) return
+
+        val oldReader = imageReader
+        val reader = makeReader(screenW, screenH)
+        virtualDisplay?.resize(screenW, screenH, dpi)
+        virtualDisplay?.surface = reader.surface
+        imageReader = reader
+        synchronized(lock) {
+            latest?.close()
+            latest = null
+        }
+        oldReader?.close()
+
+        val lp = buttonLp
+        val b = button
+        if (lp != null && b != null) {
+            lp.x = lp.x.coerceIn(0, maxOf(0, screenW - lp.width))
+            lp.y = lp.y.coerceIn(0, maxOf(0, screenH - lp.height))
+            wm.updateViewLayout(b, lp)
+        }
     }
 
     private fun grabBitmap(): Bitmap? {
@@ -271,14 +328,56 @@ class OverlayService : Service() {
         holding = true
         requestId += 1
         val id = requestId
+        val startedAt = SystemClock.uptimeMillis()
+        bgHandler.post {
+            waitForSettle(id, startedAt) { grabAndProcess(id) }
+        }
+    }
 
-        val bmp = grabBitmap()
-        showOverlay("Đang dịch...")
-        if (bmp == null) {
-            setBanner("Chưa chụp được màn hình, thử lại")
+    private fun onHoldEnd() {
+        holding = false
+        requestId += 1
+        hideOverlay()
+    }
+
+    private fun waitForSettle(id: Int, startedAt: Long, then: () -> Unit) {
+        if (!holding || id != requestId) return
+        val now = SystemClock.uptimeMillis()
+        val quiet = now - lastFrameTime
+        if (quiet >= 150 || now - startedAt >= 700) {
+            then()
             return
         }
+        bgHandler.postDelayed({ waitForSettle(id, startedAt, then) }, 50)
+    }
 
+    private fun grabAndProcess(id: Int) {
+        if (!holding || id != requestId) return
+        val bmp = grabBitmap()
+        val scale = if (bmp != null && bmp.width <= 800) 2f else 1.5f
+        val scaled = if (bmp != null) {
+            Bitmap.createScaledBitmap(
+                bmp, (bmp.width * scale).toInt(), (bmp.height * scale).toInt(), true
+            )
+        } else {
+            null
+        }
+        mainHandler.post {
+            if (!holding || id != requestId) return@post
+            showOverlay("Đang dịch...")
+            if (bmp == null || scaled == null) {
+                setBanner("Chưa chụp được màn hình, thử lại")
+                return@post
+            }
+            runOcr(bmp, scaled, scale, id)
+        }
+    }
+
+    private fun looksVietnamese(s: String): Boolean = s.any { VI_CHARS.indexOf(it) >= 0 }
+
+    private fun norm(s: String): String = s.lowercase().filter { it.isLetterOrDigit() }
+
+    private fun runOcr(bmp: Bitmap, scaled: Bitmap, scale: Float, id: Int) {
         val lp = buttonLp
         val btnRect = if (lp != null) {
             Rect(lp.x - 10, lp.y - 10, lp.x + lp.width + 10, lp.y + lp.height + 10)
@@ -286,32 +385,32 @@ class OverlayService : Service() {
             Rect()
         }
 
-        recognizer.process(InputImage.fromBitmap(bmp, 0))
+        recognizer.process(InputImage.fromBitmap(scaled, 0))
             .addOnSuccessListener { result ->
                 if (!holding || id != requestId) return@addOnSuccessListener
                 val blocks = ArrayList<Block>()
                 for (b in result.textBlocks) {
-                    val box = b.boundingBox ?: continue
+                    val rb = b.boundingBox ?: continue
+                    val box = Rect(
+                        (rb.left / scale).toInt(), (rb.top / scale).toInt(),
+                        (rb.right / scale).toInt(), (rb.bottom / scale).toInt()
+                    )
                     val text = b.text.replace("\n", " ").trim()
                     if (text.length < 2 || !text.any { it.isLetter() }) continue
+                    if (looksVietnamese(text)) continue
                     if (Rect.intersects(box, btnRect)) continue
                     blocks.add(Block(text, box))
                 }
                 if (blocks.isEmpty()) {
-                    setBanner("Không thấy chữ nào để dịch")
+                    setBanner("Không có chữ nước ngoài nào để dịch")
                     return@addOnSuccessListener
                 }
+                blocks.sortWith(compareBy<Block>({ it.box.top / 40 }, { it.box.left }))
                 netExecutor.execute { translate(blocks, bmp, id) }
             }
             .addOnFailureListener {
                 if (holding && id == requestId) setBanner("Lỗi khi đọc chữ trên màn hình")
             }
-    }
-
-    private fun onHoldEnd() {
-        holding = false
-        requestId += 1
-        hideOverlay()
     }
 
     private fun translate(blocks: List<Block>, bmp: Bitmap, id: Int) {
@@ -323,13 +422,32 @@ class OverlayService : Service() {
                 showMessage("Chưa có API key")
                 return
             }
-            val results = callGemini(key, model, blocks.map { it.text })
+            val all = ArrayList<String>()
+            var from = 0
+            while (from < blocks.size) {
+                if (!holding || id != requestId) return
+                val chunk = blocks.subList(from, minOf(from + CHUNK, blocks.size))
+                all.addAll(callWithRetry(key, model, chunk.map { it.text }))
+                from += CHUNK
+            }
             mainHandler.post {
-                if (holding && id == requestId) drawTranslations(blocks, results, bmp)
+                if (holding && id == requestId) drawTranslations(blocks, all, bmp)
             }
         } catch (e: Exception) {
             showMessage(e.message ?: "Lỗi khi dịch")
         }
+    }
+
+    private fun callWithRetry(key: String, model: String, texts: List<String>): List<String> {
+        var last: Exception? = null
+        for (attempt in 1..2) {
+            try {
+                return callGemini(key, model, texts)
+            } catch (e: RetryException) {
+                last = e
+            }
+        }
+        throw Exception(last?.message ?: "Lỗi khi dịch")
     }
 
     private fun callGemini(key: String, model: String, texts: List<String>): List<String> {
@@ -371,22 +489,30 @@ class OverlayService : Service() {
 
             val code = conn.responseCode
             if (code != 200) {
-                val msg = when (code) {
-                    429 -> "Hết lượt miễn phí, hãy thử lại sau"
-                    400, 403 -> "API key hoặc tên model bị từ chối (lỗi $code)"
-                    404 -> "Không tìm thấy model, hãy kiểm tra tên model"
-                    else -> "Lỗi Gemini ($code)"
+                when {
+                    code == 429 -> throw Exception("Hết lượt miễn phí, hãy thử lại sau")
+                    code in 500..599 -> throw RetryException("Gemini đang bận ($code)")
+                    code == 404 -> throw Exception("Không tìm thấy model, hãy kiểm tra tên model")
+                    else -> throw Exception("API key hoặc tên model bị từ chối (lỗi $code)")
                 }
-                throw Exception(msg)
             }
-            val resp = conn.inputStream.bufferedReader().use { it.readText() }
-            val text = JSONObject(resp)
-                .getJSONArray("candidates").getJSONObject(0)
-                .getJSONObject("content")
-                .getJSONArray("parts").getJSONObject(0)
-                .getString("text")
-            val arr = JSONArray(text)
-            return List(texts.size) { i -> if (i < arr.length()) arr.optString(i, "") else "" }
+            val arr: JSONArray = try {
+                val resp = conn.inputStream.bufferedReader().use { it.readText() }
+                val text = JSONObject(resp)
+                    .getJSONArray("candidates").getJSONObject(0)
+                    .getJSONObject("content")
+                    .getJSONArray("parts").getJSONObject(0)
+                    .getString("text")
+                JSONArray(text)
+            } catch (e: JSONException) {
+                throw RetryException("Gemini trả sai định dạng")
+            }
+            if (arr.length() != texts.size) {
+                throw RetryException("Gemini trả thiếu kết quả")
+            }
+            return List(texts.size) { i -> arr.optString(i, "") }
+        } catch (e: IOException) {
+            throw RetryException("Lỗi mạng, thử lại")
         } finally {
             conn.disconnect()
         }
@@ -474,8 +600,9 @@ class OverlayService : Service() {
         root.removeAllViews()
         var drawn = 0
         for (i in blocks.indices) {
-            val t = results[i].trim()
+            val t = results.getOrElse(i) { "" }.trim()
             if (t.isEmpty()) continue
+            if (norm(t) == norm(blocks[i].text)) continue
             val box = blocks[i].box
             val bgColor = sampleColor(bmp, box)
             val textColor = if (isDark(bgColor)) Color.WHITE else Color.BLACK
@@ -487,19 +614,38 @@ class OverlayService : Service() {
                 setPadding(4, 2, 4, 2)
                 setAutoSizeTextTypeUniformWithConfiguration(8, 24, 1, TypedValue.COMPLEX_UNIT_SP)
             }
-            val w = maxOf(box.width(), 40)
-            val h = maxOf(box.height(), 30)
+            val w = maxOf(box.width() + 12, 40)
+            val h = maxOf(box.height() + 6, 30)
             val lp = FrameLayout.LayoutParams(w, h)
-            lp.leftMargin = box.left
-            lp.topMargin = box.top
+            lp.leftMargin = maxOf(box.left - 6, 0)
+            lp.topMargin = maxOf(box.top - 3, 0)
             root.addView(tv, lp)
             drawn++
         }
-        if (drawn == 0) setBanner("Không có gì cần dịch trên màn hình này")
+        if (drawn == 0) {
+            setBanner("Không có gì cần dịch trên màn hình này")
+            return
+        }
+        val label = TextView(this).apply {
+            text = "Đã dịch $drawn/${blocks.size} khối"
+            setTextColor(Color.WHITE)
+            textSize = 12f
+            setPadding(16, 8, 16, 8)
+            setBackgroundColor(Color.parseColor("#B3000000"))
+        }
+        val llp = FrameLayout.LayoutParams(
+            FrameLayout.LayoutParams.WRAP_CONTENT,
+            FrameLayout.LayoutParams.WRAP_CONTENT,
+            Gravity.BOTTOM or Gravity.CENTER_HORIZONTAL
+        )
+        llp.bottomMargin = 160
+        root.addView(label, llp)
     }
 
     override fun onDestroy() {
         holding = false
+        mainHandler.removeCallbacksAndMessages(null)
+        if (::bgHandler.isInitialized) bgHandler.removeCallbacksAndMessages(null)
         hideOverlay()
         button?.let { wm.removeView(it) }
         button = null
